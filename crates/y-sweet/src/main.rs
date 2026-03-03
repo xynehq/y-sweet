@@ -14,6 +14,7 @@ use tracing::metadata::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use url::Url;
 use y_sweet::cli::{print_auth_message, print_server_url};
+use y_sweet::server::SnapshotConfig;
 use y_sweet::stores::filesystem::FileSystemStore;
 use y_sweet_core::{
     auth::Authenticator,
@@ -59,6 +60,21 @@ enum ServSubcommand {
 
         #[clap(long, default_value = "false", env = "Y_SWEET_SKIP_GC")]
         skip_gc: bool,
+
+        #[clap(long, default_value = "false", env = "Y_SWEET_SNAPSHOTS_ENABLED")]
+        snapshots_enabled: bool,
+        #[clap(long, env = "Y_SWEET_SNAPSHOTS_MANUAL")]
+        snapshots_manual: Option<bool>,
+        #[clap(long, env = "Y_SWEET_SNAPSHOTS_BEFORE_ROLLBACK")]
+        snapshots_before_rollback: Option<bool>,
+        #[clap(long, env = "Y_SWEET_SNAPSHOTS_ON_PERSIST")]
+        snapshots_on_persist: Option<bool>,
+        #[clap(long, default_value = "3600", env = "Y_SWEET_SNAPSHOTS_ON_PERSIST_INTERVAL_SECS")]
+        snapshots_on_persist_interval_secs: u64,
+        #[clap(long, env = "Y_SWEET_SNAPSHOTS_ON_GC")]
+        snapshots_on_gc: Option<bool>,
+        #[clap(long, env = "Y_SWEET_SNAPSHOTS_RETENTION_MAX")]
+        snapshots_retention_max: Option<usize>,
     },
 
     GenAuth {
@@ -182,6 +198,13 @@ async fn main() -> Result<()> {
             prod,
             max_body_size,
             skip_gc,
+            snapshots_enabled,
+            snapshots_manual,
+            snapshots_before_rollback,
+            snapshots_on_persist,
+            snapshots_on_persist_interval_secs,
+            snapshots_on_gc,
+            snapshots_retention_max,
         } => {
             let auth = if let Some(auth) = auth {
                 Some(Authenticator::new(auth)?)
@@ -213,6 +236,16 @@ async fn main() -> Result<()> {
 
             let token = CancellationToken::new();
 
+            let snapshot_config = SnapshotConfig {
+                enabled: *snapshots_enabled,
+                manual: snapshots_manual.unwrap_or(*snapshots_enabled),
+                before_rollback: snapshots_before_rollback.unwrap_or(*snapshots_enabled),
+                on_persist: snapshots_on_persist.unwrap_or(false),
+                on_persist_interval_secs: *snapshots_on_persist_interval_secs,
+                on_gc: snapshots_on_gc.unwrap_or(false),
+                retention_max: *snapshots_retention_max,
+            };
+
             let server = y_sweet::server::Server::new(
                 store,
                 std::time::Duration::from_secs(*checkpoint_freq_seconds),
@@ -222,6 +255,7 @@ async fn main() -> Result<()> {
                 true,
                 *max_body_size,
                 *skip_gc,
+                snapshot_config,
             )
             .await?;
 
@@ -322,6 +356,7 @@ async fn main() -> Result<()> {
                 false,
                 *max_body_size,
                 *skip_gc,
+                SnapshotConfig::default(),
             )
             .await?;
 

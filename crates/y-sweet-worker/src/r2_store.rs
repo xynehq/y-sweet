@@ -71,4 +71,10 @@ impl Store for R2Store {
             .map(|r| r.is_some())
             .map_err(|e| StoreError::ConnectionError(format!("Failed to head object {e}")))
     }
+
+    async fn list_prefix(&self, _prefix: &str) -> Result<Vec<String>> {
+        Err(StoreError::Unsupported(
+            "R2 list_prefix not implemented; use manifest for snapshot listing".to_string(),
+        ))
+    }
 }
