@@ -8,14 +8,17 @@ on:
       - "tests/**"
       - "crates/**"
       - "js-pkg/**"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  # In a fork, set Variable CICD_RUNNER_IMAGE to your runner image (e.g. ghcr.io/<you>/cicd-runner-base:main).
+  RUNNER_IMAGE: ${{ vars.CICD_RUNNER_IMAGE || 'ghcr.io/jamsocket/cicd-runner-base:main' }}
 
 jobs:
   integration-test:
     runs-on: ubuntu-latest-16-cores
-    container: ghcr.io/jamsocket/cicd-runner-base:main
+    container: ${{ env.RUNNER_IMAGE }}
 
     steps:
     - uses: actions/checkout@v4
