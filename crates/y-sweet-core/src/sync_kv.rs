@@ -49,6 +49,20 @@ impl SyncKv {
         })
     }
 
+    /// Build a SyncKv from raw snapshot bytes (e.g. from a snapshot blob). No store; never persists.
+    /// Used for read-only snapshot view (e.g. encoding as Yjs update).
+    pub fn from_snapshot_bytes(bytes: &[u8]) -> Result<Self> {
+        let data = bincode::deserialize(bytes).context("Failed to deserialize snapshot")?;
+        Ok(Self {
+            data: Arc::new(Mutex::new(data)),
+            store: None,
+            key: String::new(),
+            dirty: AtomicBool::new(false),
+            dirty_callback: Box::new(|| {}),
+            shutdown: AtomicBool::new(false),
+        })
+    }
+
     fn mark_dirty(&self) {
         if !self.shutdown.load(Ordering::SeqCst) {
             let was_updated = !self.dirty.swap(true, Ordering::SeqCst);

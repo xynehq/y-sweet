@@ -10,7 +10,10 @@ use worker::{
 #[allow(unused)]
 use worker_sys::console_log;
 use y_sweet_core::{
-    api_types::Authorization, doc_connection::DocConnection, doc_sync::DocWithSyncKv,
+    api_types::Authorization,
+    doc_connection::DocConnection,
+    doc_sync::{self, DocWithSyncKv},
+    store::{self, Store, StoreError},
 };
 
 #[durable_object]
@@ -100,6 +103,10 @@ impl DurableObject for YServe {
             .get_async("/doc/ws/:doc_id", websocket_connect)
             .get_async("/doc/:doc_id/as-update", as_update)
             .post_async("/doc/:doc_id/update", update_doc)
+            .get_async("/doc/:doc_id/snapshots", do_list_snapshots)
+            .post_async("/doc/:doc_id/snapshots", do_create_snapshot)
+            .get_async("/doc/:doc_id/snapshots/:timestamp/as-update", do_get_snapshot_as_update)
+            .post_async("/doc/:doc_id/snapshots/:timestamp/rollback", do_rollback_snapshot)
             .run(req, env)
             .await
     }
@@ -157,6 +164,133 @@ async fn handle_doc_create(req: Request, ctx: RouteContext<&mut YServe>) -> Resu
         .await
         .map_err(|_| "Couldn't get doc.")?;
 
+    Response::ok("ok")
+}
+
+fn context_from_request(req: &Request, env: &Env) -> std::result::Result<ServerContext, worker::Error> {
+    ServerContext::from_request(req, env).map_err(|e| worker::Error::RustError(e.to_string()))
+}
+
+async fn do_list_snapshots(req: Request, ctx: RouteContext<&mut YServe>) -> Result<Response> {
+    let mut context = context_from_request(&req, &ctx.data.env)?;
+    if !context.config.snapshots_enabled {
+        return Response::error("Snapshots disabled", 404)?;
+    }
+    let store = context.store();
+    let doc_id = ctx
+        .param("doc_id")
+        .ok_or_else(|| worker::Error::RustError("doc_id".into()))?
+        .to_string();
+    let prefix = store::snapshot_prefix(&doc_id);
+    let keys = match store.list_prefix(&prefix).await {
+        Ok(k) => k,
+        Err(StoreError::Unsupported(_)) => vec![],
+        Err(_) => return Response::error("List failed", 500)?,
+    };
+    let mut ids: Vec<String> = keys
+        .iter()
+        .filter_map(|k| {
+            let rest = k.strip_prefix(&prefix)?;
+            rest.strip_suffix("/data.ysweet").map(String::from)
+        })
+        .collect();
+    ids.reverse();
+    Response::from_json(&serde_json::json!({ "timestamps": ids }))
+}
+
+async fn do_create_snapshot(req: Request, ctx: RouteContext<&mut YServe>) -> Result<Response> {
+    let mut context = context_from_request(&req, &ctx.data.env)?;
+    if !context.config.snapshots_enabled {
+        return Response::error("Snapshots disabled", 403)?;
+    }
+    let store = context.store();
+    let doc_id = ctx
+        .param("doc_id")
+        .ok_or_else(|| worker::Error::RustError("doc_id".into()))?
+        .to_string();
+    let _doc = ctx
+        .data
+        .get_doc(&req, &doc_id)
+        .await
+        .map_err(|e| worker::Error::RustError(e.to_string()))?;
+    let _ = _doc.sync_kv().persist().await;
+    let data_key = store::doc_data_key(&doc_id);
+    let data = match store.get(&data_key).await {
+        Ok(Some(d)) => d,
+        _ => return Response::error("No document data", 404)?,
+    };
+    let ts = worker::Date::now().as_millis().to_string();
+    let snap_key = store::snapshot_key(&doc_id, &ts);
+    store
+        .set(&snap_key, data)
+        .await
+        .map_err(|e| worker::Error::RustError(e.to_string()))?;
+    Response::from_json(&serde_json::json!({ "timestamp": ts }))
+}
+
+async fn do_get_snapshot_as_update(
+    req: Request,
+    ctx: RouteContext<&mut YServe>,
+) -> Result<Response> {
+    let mut context = context_from_request(&req, &ctx.data.env)?;
+    if !context.config.snapshots_enabled {
+        return Response::error("Snapshots disabled", 404)?;
+    }
+    let store = context.store();
+    let doc_id = ctx
+        .param("doc_id")
+        .ok_or_else(|| worker::Error::RustError("doc_id".into()))?
+        .to_string();
+    let timestamp = ctx
+        .param("timestamp")
+        .ok_or_else(|| worker::Error::RustError("timestamp".into()))?
+        .to_string();
+    if !store::is_valid_snapshot_timestamp(&timestamp) {
+        return Response::error("Invalid snapshot timestamp", 400)?;
+    }
+    let key = store::snapshot_key(&doc_id, &timestamp);
+    let bytes = match store.get(&key).await {
+        Ok(Some(b)) => b,
+        _ => return Response::error("Snapshot not found", 404)?,
+    };
+    let update = doc_sync::snapshot_bytes_to_update(&bytes)
+        .map_err(|e| worker::Error::RustError(e.to_string()))?;
+    Response::from_bytes(update)
+}
+
+async fn do_rollback_snapshot(req: Request, ctx: RouteContext<&mut YServe>) -> Result<Response> {
+    let mut context = context_from_request(&req, &ctx.data.env)?;
+    if !context.config.snapshots_enabled {
+        return Response::error("Snapshots disabled", 403)?;
+    }
+    let store = context.store();
+    let doc_id = ctx
+        .param("doc_id")
+        .ok_or_else(|| worker::Error::RustError("doc_id".into()))?
+        .to_string();
+    let timestamp = ctx
+        .param("timestamp")
+        .ok_or_else(|| worker::Error::RustError("timestamp".into()))?
+        .to_string();
+    if !store::is_valid_snapshot_timestamp(&timestamp) {
+        return Response::error("Invalid snapshot timestamp", 400)?;
+    }
+    let data_key = store::doc_data_key(&doc_id);
+    let snap_key = store::snapshot_key(&doc_id, &timestamp);
+    let snapshot_data = match store.get(&snap_key).await {
+        Ok(Some(d)) => d,
+        _ => return Response::error("Snapshot not found", 404)?,
+    };
+    if let Ok(Some(current)) = store.get(&data_key).await {
+        let backup_ts = worker::Date::now().as_millis().to_string();
+        let backup_key = store::snapshot_key(&doc_id, &backup_ts);
+        let _ = store.set(&backup_key, current).await;
+    }
+    store
+        .set(&data_key, snapshot_data)
+        .await
+        .map_err(|e| worker::Error::RustError(e.to_string()))?;
+    ctx.data.lazy_doc = None;
     Response::ok("ok")
 }
 
