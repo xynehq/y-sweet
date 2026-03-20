@@ -4,6 +4,21 @@ use std::sync::{Arc, RwLock};
 use yrs::{updates::decoder::Decode, ReadTxn, StateVector, Subscription, Transact, Update};
 use yrs_kvstore::DocOps;
 
+/// Decode snapshot blob bytes (same format as data.ysweet) into a Yjs state update.
+/// Used for read-only snapshot serving (no persistence, no subscription).
+pub fn snapshot_bytes_to_update(bytes: &[u8]) -> Result<Vec<u8>> {
+    let sync_kv = SyncKv::from_snapshot_bytes(bytes)?;
+    let doc = yrs::Doc::new();
+    {
+        let mut txn = doc.transact_mut();
+        sync_kv
+            .load_doc(DOC_NAME, &mut txn)
+            .map_err(|_| anyhow!("Failed to load doc from snapshot"))?;
+    }
+    let txn = doc.transact();
+    Ok(txn.encode_state_as_update_v1(&StateVector::default()))
+}
+
 pub struct DocWithSyncKv {
     awareness: Arc<RwLock<Awareness>>,
     sync_kv: Arc<SyncKv>,

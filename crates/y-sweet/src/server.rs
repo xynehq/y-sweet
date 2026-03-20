@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     net::TcpListener,
@@ -37,8 +37,8 @@ use y_sweet_core::{
     },
     auth::{Authenticator, ExpirationTimeEpochMillis, DEFAULT_EXPIRATION_SECONDS},
     doc_connection::DocConnection,
-    doc_sync::DocWithSyncKv,
-    store::Store,
+    doc_sync::{self, DocWithSyncKv},
+    store::{self, Store, StoreError},
     sync::awareness::Awareness,
     sync_kv::SyncKv,
 };
@@ -55,6 +55,48 @@ fn current_time_epoch_millis() -> u64 {
     let now = std::time::SystemTime::now();
     let duration_since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
     duration_since_epoch.as_millis() as u64
+}
+
+/// Retention: keep only the latest N snapshots (by count). Deletes by store creation order (oldest first).
+/// list_prefix returns keys oldest-first; we delete the first (len - max_count) keys. No sorting in our code.
+async fn apply_snapshot_retention_impl(
+    store: &Arc<Box<dyn Store>>,
+    doc_id: &str,
+    retention_max: Option<usize>,
+) {
+    let max_count = match retention_max {
+        Some(n) if n > 0 => n,
+        _ => return,
+    };
+    let prefix = store::snapshot_prefix(doc_id);
+    let keys = match store.list_prefix(&prefix).await {
+        Ok(k) => k,
+        Err(StoreError::Unsupported(_)) => return,
+        Err(_) => return,
+    };
+    if keys.len() <= max_count {
+        return;
+    }
+    let n_remove = keys.len() - max_count;
+    for key in keys.into_iter().take(n_remove) {
+        let _ = store.remove(&key).await;
+    }
+}
+
+/// Context for on-persist snapshot creation (throttled). Passed into doc_persistence_worker when on_persist is enabled.
+struct OnPersistSnapshotCtx {
+    store: Arc<Box<dyn Store>>,
+    doc_id: String,
+    interval_secs: u64,
+    retention_max: Option<usize>,
+    last_snapshot: Arc<DashMap<String, Instant>>,
+}
+
+/// Context for on-GC snapshot (create snapshot when doc is evicted). Passed into doc_gc_worker when on_gc is enabled.
+struct OnGcSnapshotCtx {
+    store: Arc<Box<dyn Store>>,
+    doc_id: String,
+    retention_max: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -80,6 +122,33 @@ impl std::fmt::Display for AppError {
     }
 }
 
+/// Snapshot feature configuration (ENV-driven).
+#[derive(Clone, Debug)]
+pub struct SnapshotConfig {
+    pub enabled: bool,
+    pub manual: bool,
+    pub before_rollback: bool,
+    pub on_persist: bool,
+    pub on_persist_interval_secs: u64,
+    pub on_gc: bool,
+    /// Max number of snapshots to keep per doc (oldest removed). Numbers-only retention; no time-based pruning.
+    pub retention_max: Option<usize>,
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            manual: false,
+            before_rollback: true,
+            on_persist: false,
+            on_persist_interval_secs: 3600,
+            on_gc: false,
+            retention_max: None,
+        }
+    }
+}
+
 pub struct Server {
     docs: Arc<DashMap<String, DocWithSyncKv>>,
     doc_worker_tracker: TaskTracker,
@@ -94,6 +163,9 @@ pub struct Server {
     max_body_size: Option<usize>,
     /// Whether to skip garbage collection in Yrs documents.
     skip_gc: bool,
+    snapshot_config: SnapshotConfig,
+    /// Last time we created an on-persist snapshot per doc_id (for throttling).
+    last_snapshot_per_doc: Arc<DashMap<String, Instant>>,
 }
 
 impl Server {
@@ -106,6 +178,7 @@ impl Server {
         doc_gc: bool,
         max_body_size: Option<usize>,
         skip_gc: bool,
+        snapshot_config: SnapshotConfig,
     ) -> Result<Self> {
         Ok(Self {
             docs: Arc::new(DashMap::new()),
@@ -118,7 +191,13 @@ impl Server {
             doc_gc,
             max_body_size,
             skip_gc,
+            snapshot_config: snapshot_config.clone(),
+            last_snapshot_per_doc: Arc::new(DashMap::new()),
         })
+    }
+
+    pub fn snapshot_config(&self) -> &SnapshotConfig {
+        &self.snapshot_config
     }
 
     pub async fn doc_exists(&self, doc_id: &str) -> bool {
@@ -127,7 +206,7 @@ impl Server {
         }
         if let Some(store) = &self.store {
             store
-                .exists(&format!("{}/data.ysweet", doc_id))
+                .exists(&store::doc_data_key(doc_id))
                 .await
                 .unwrap_or_default()
         } else {
@@ -167,6 +246,16 @@ impl Server {
             let doc_id = doc_id.to_string();
             let cancellation_token = self.cancellation_token.clone();
 
+            let on_persist_ctx = (self.snapshot_config.enabled && self.snapshot_config.on_persist
+                && self.store.is_some())
+                .then(|| OnPersistSnapshotCtx {
+                    store: self.store.as_ref().unwrap().clone(),
+                    doc_id: doc_id.clone(),
+                    interval_secs: self.snapshot_config.on_persist_interval_secs,
+                    retention_max: self.snapshot_config.retention_max,
+                    last_snapshot: self.last_snapshot_per_doc.clone(),
+                });
+
             // Spawn a task to save the document to the store when it changes.
             self.doc_worker_tracker.spawn(
                 Self::doc_persistence_worker(
@@ -175,17 +264,26 @@ impl Server {
                     checkpoint_freq,
                     doc_id.clone(),
                     cancellation_token.clone(),
+                    on_persist_ctx,
                 )
                 .instrument(span!(Level::INFO, "save_loop", doc_id=?doc_id)),
             );
 
             if self.doc_gc {
+                let on_gc_ctx = (self.snapshot_config.enabled && self.snapshot_config.on_gc
+                    && self.store.is_some())
+                    .then(|| OnGcSnapshotCtx {
+                        store: self.store.as_ref().unwrap().clone(),
+                        doc_id: doc_id.clone(),
+                        retention_max: self.snapshot_config.retention_max,
+                    });
                 self.doc_worker_tracker.spawn(
                     Self::doc_gc_worker(
                         self.docs.clone(),
                         doc_id.clone(),
                         checkpoint_freq,
                         cancellation_token,
+                        on_gc_ctx,
                     )
                     .instrument(span!(Level::INFO, "gc_loop", doc_id=?doc_id)),
                 );
@@ -201,6 +299,7 @@ impl Server {
         doc_id: String,
         checkpoint_freq: Duration,
         cancellation_token: CancellationToken,
+        on_gc_ctx: Option<OnGcSnapshotCtx>,
     ) {
         let mut checkpoints_without_refs = 0;
 
@@ -223,6 +322,16 @@ impl Server {
                     if checkpoints_without_refs >= 2 {
                         tracing::info!("GCing doc");
                         if let Some(doc) = docs.get(&doc_id) {
+                            let _ = doc.sync_kv().persist().await;
+                            if let Some(ctx) = &on_gc_ctx {
+                                let data_key = store::doc_data_key(&ctx.doc_id);
+                                if let Ok(Some(data)) = ctx.store.get(&data_key).await {
+                                    let ts = current_time_epoch_millis().to_string();
+                                    let snap_key = store::snapshot_key(&ctx.doc_id, &ts);
+                                    let _ = ctx.store.set(&snap_key, data).await;
+                                    apply_snapshot_retention_impl(&ctx.store, &ctx.doc_id, ctx.retention_max).await;
+                                }
+                            }
                             doc.sync_kv().shutdown();
                         }
 
@@ -244,8 +353,9 @@ impl Server {
         checkpoint_freq: Duration,
         doc_id: String,
         cancellation_token: CancellationToken,
+        on_persist_ctx: Option<OnPersistSnapshotCtx>,
     ) {
-        let mut last_save = std::time::Instant::now();
+        let mut last_save = Instant::now();
 
         loop {
             let is_done = tokio::select! {
@@ -257,7 +367,7 @@ impl Server {
             };
 
             tracing::info!("Received signal. done: {}", is_done);
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             if !is_done && now - last_save < checkpoint_freq {
                 let sleep = tokio::time::sleep(checkpoint_freq - (now - last_save));
                 tokio::pin!(sleep);
@@ -284,12 +394,33 @@ impl Server {
                 }
             }
             tracing::info!("Persisting.");
-            if let Err(e) = sync_kv.persist().await {
-                tracing::error!(?e, "Error persisting.");
+            let persist_ok = sync_kv.persist().await.is_ok();
+            if !persist_ok {
+                tracing::error!("Error persisting.");
             } else {
                 tracing::info!("Done persisting.");
             }
-            last_save = std::time::Instant::now();
+            if persist_ok {
+                if let Some(ctx) = &on_persist_ctx {
+                    let should_snapshot = ctx
+                        .last_snapshot
+                        .get(&ctx.doc_id)
+                        .map(|t| now.duration_since(*t).as_secs() >= ctx.interval_secs)
+                        .unwrap_or(true);
+                    if should_snapshot {
+                        let data_key = store::doc_data_key(&ctx.doc_id);
+                        if let Ok(Some(data)) = ctx.store.get(&data_key).await {
+                            let ts = current_time_epoch_millis().to_string();
+                            let snap_key = store::snapshot_key(&ctx.doc_id, &ts);
+                            if ctx.store.set(&snap_key, data).await.is_ok() {
+                                ctx.last_snapshot.insert(ctx.doc_id.clone(), now);
+                                apply_snapshot_retention_impl(&ctx.store, &ctx.doc_id, ctx.retention_max).await;
+                            }
+                        }
+                    }
+                }
+            }
+            last_save = Instant::now();
 
             if is_done {
                 break;
@@ -301,7 +432,7 @@ impl Server {
     pub async fn get_or_create_doc(
         &self,
         doc_id: &str,
-    ) -> Result<MappedRef<String, DocWithSyncKv, DocWithSyncKv>> {
+    ) -> Result<MappedRef<'_, String, DocWithSyncKv, DocWithSyncKv>> {
         if !self.docs.contains_key(doc_id) {
             tracing::info!(doc_id=?doc_id, "Loading doc");
             self.load_doc(doc_id).await?;
@@ -312,6 +443,160 @@ impl Server {
             .get(doc_id)
             .ok_or_else(|| anyhow!("Failed to get-or-create doc"))?
             .map(|d| d))
+    }
+
+    /// List snapshot timestamps for a document (newest first). Returns empty if snapshots disabled or store does not support list.
+    pub async fn list_snapshots(&self, doc_id: &str) -> Result<Vec<String>, AppError> {
+        if !self.snapshot_config.enabled {
+            return Err(AppError(
+                StatusCode::NOT_FOUND,
+                anyhow!("Snapshots are disabled"),
+            ));
+        }
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, anyhow!("No store configured")))?;
+        let prefix = store::snapshot_prefix(doc_id);
+        let keys = match store.list_prefix(&prefix).await {
+            Ok(k) => k,
+            Err(StoreError::Unsupported(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into())),
+        };
+        let mut ids: Vec<String> = keys
+            .into_iter()
+            .filter_map(|k| {
+                let rest = k.strip_prefix(&prefix)?;
+                rest.strip_suffix("/data.ysweet").map(String::from)
+            })
+            .collect();
+        ids.reverse();
+        Ok(ids)
+    }
+
+    /// Create a snapshot of the current document state.
+    pub async fn create_snapshot(&self, doc_id: &str) -> Result<String, AppError> {
+        if !self.snapshot_config.enabled || !self.snapshot_config.manual {
+            return Err(AppError(
+                StatusCode::FORBIDDEN,
+                anyhow!("Snapshot creation is disabled"),
+            ));
+        }
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, anyhow!("No store configured")))?;
+        let data_key = store::doc_data_key(doc_id);
+        let data = store
+            .get(&data_key)
+            .await
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+            .ok_or_else(|| AppError(StatusCode::NOT_FOUND, anyhow!("Document has no data yet")))?;
+        let ts = current_time_epoch_millis().to_string();
+        let snap_key = store::snapshot_key(doc_id, &ts);
+        store
+            .set(&snap_key, data)
+            .await
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+        self.apply_snapshot_retention(doc_id).await?;
+        Ok(ts)
+    }
+
+    /// Delete excess snapshots per retention_max (numbers-only). Ignores errors (e.g. store doesn't support list/remove).
+    async fn apply_snapshot_retention(&self, doc_id: &str) -> Result<(), AppError> {
+        if let Some(store) = &self.store {
+            apply_snapshot_retention_impl(store, doc_id, self.snapshot_config.retention_max).await;
+        }
+        Ok(())
+    }
+
+    /// Return a snapshot as Yjs update bytes (read-only).
+    pub async fn get_snapshot_as_update(
+        &self,
+        doc_id: &str,
+        timestamp: &str,
+    ) -> Result<Vec<u8>, AppError> {
+        if !self.snapshot_config.enabled {
+            return Err(AppError(
+                StatusCode::NOT_FOUND,
+                anyhow!("Snapshots are disabled"),
+            ));
+        }
+        if !store::is_valid_snapshot_timestamp(timestamp) {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                anyhow!("Invalid snapshot timestamp"),
+            ));
+        }
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, anyhow!("No store configured")))?;
+        let key = store::snapshot_key(doc_id, timestamp);
+        let bytes = store
+            .get(&key)
+            .await
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+            .ok_or_else(|| AppError(StatusCode::NOT_FOUND, anyhow!("Snapshot not found")))?;
+        doc_sync::snapshot_bytes_to_update(&bytes)
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e))
+    }
+
+    /// Rollback document to a snapshot. If before_rollback is true, current state is saved as a new snapshot first.
+    pub async fn rollback_to_snapshot(
+        &self,
+        doc_id: &str,
+        timestamp: &str,
+    ) -> Result<(), AppError> {
+        if !self.snapshot_config.enabled {
+            return Err(AppError(
+                StatusCode::FORBIDDEN,
+                anyhow!("Snapshots are disabled"),
+            ));
+        }
+        if !store::is_valid_snapshot_timestamp(timestamp) {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                anyhow!("Invalid snapshot timestamp"),
+            ));
+        }
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, anyhow!("No store configured")))?;
+        let data_key = store::doc_data_key(doc_id);
+        let snap_key = store::snapshot_key(doc_id, timestamp);
+        let snapshot_data = store
+            .get(&snap_key)
+            .await
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+            .ok_or_else(|| AppError(StatusCode::NOT_FOUND, anyhow!("Snapshot not found")))?;
+        if self.snapshot_config.before_rollback {
+            if let Some(current) = store.get(&data_key).await.map_err(|e| {
+                AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into())
+            })? {
+                let backup_ts = current_time_epoch_millis().to_string();
+                let backup_key = store::snapshot_key(doc_id, &backup_ts);
+                store
+                    .set(&backup_key, current)
+                    .await
+                    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+                self.apply_snapshot_retention(doc_id).await?;
+            }
+        }
+        store
+            .set(&data_key, snapshot_data)
+            .await
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+        if self.docs.contains_key(doc_id) {
+            if let Some((_, doc)) = self.docs.remove(doc_id) {
+                doc.sync_kv().shutdown();
+            }
+            self.load_doc(doc_id).await.map_err(|e| {
+                AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Reload after rollback: {}", e))
+            })?;
+        }
+        Ok(())
     }
 
     pub fn check_auth(
@@ -343,7 +628,7 @@ impl Server {
     }
 
     pub fn routes(self: &Arc<Self>) -> Router {
-        Router::new()
+        let mut router = Router::new()
             .route("/ready", get(ready))
             .route("/check_store", post(check_store))
             .route("/check_store", get(check_store_deprecated))
@@ -357,8 +642,21 @@ impl Server {
             .route(
                 "/d/:doc_id/ws/:doc_id2",
                 get(handle_socket_upgrade_full_path),
-            )
-            .with_state(self.clone())
+            );
+        if self.snapshot_config.enabled {
+            router = router
+                .route("/d/:doc_id/snapshots", get(list_snapshots))
+                .route("/d/:doc_id/snapshots", post(create_snapshot))
+                .route(
+                    "/d/:doc_id/snapshots/:timestamp/as-update",
+                    get(get_snapshot_as_update),
+                )
+                .route(
+                    "/d/:doc_id/snapshots/:timestamp/rollback",
+                    post(rollback_snapshot),
+                );
+        }
+        router.with_state(self.clone())
     }
 
     pub fn single_doc_routes(self: &Arc<Self>) -> Router {
@@ -466,6 +764,68 @@ async fn get_doc_as_update_deprecated(
 ) -> Result<Response, AppError> {
     tracing::warn!("/doc/:doc_id/as-update is deprecated; call /doc/:doc_id/auth instead and then call as-update on the returned base URL.");
     get_doc_as_update(State(server_state), Path(doc_id), auth_header).await
+}
+
+async fn list_snapshots(
+    State(server_state): State<Arc<Server>>,
+    Path(doc_id): Path<String>,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !validate_doc_name(doc_id.as_str()) {
+        return Err(AppError(StatusCode::BAD_REQUEST, anyhow!("Invalid document name")));
+    }
+    let token = get_token_from_header(auth_header);
+    let _ = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
+    let timestamps = server_state.list_snapshots(&doc_id).await?;
+    Ok(Json(serde_json::json!({ "timestamps": timestamps })))
+}
+
+async fn create_snapshot(
+    State(server_state): State<Arc<Server>>,
+    Path(doc_id): Path<String>,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !validate_doc_name(doc_id.as_str()) {
+        return Err(AppError(StatusCode::BAD_REQUEST, anyhow!("Invalid document name")));
+    }
+    let token = get_token_from_header(auth_header);
+    let auth = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
+    if !matches!(auth, Authorization::Full) {
+        return Err(AppError(StatusCode::FORBIDDEN, anyhow!("Full auth required to create snapshot")));
+    }
+    let timestamp = server_state.create_snapshot(&doc_id).await?;
+    Ok(Json(serde_json::json!({ "timestamp": timestamp })))
+}
+
+async fn get_snapshot_as_update(
+    State(server_state): State<Arc<Server>>,
+    Path((doc_id, timestamp)): Path<(String, String)>,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+) -> Result<Response, AppError> {
+    if !validate_doc_name(doc_id.as_str()) {
+        return Err(AppError(StatusCode::BAD_REQUEST, anyhow!("Invalid document name")));
+    }
+    let token = get_token_from_header(auth_header);
+    let _ = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
+    let update = server_state.get_snapshot_as_update(&doc_id, &timestamp).await?;
+    Ok(update.into_response())
+}
+
+async fn rollback_snapshot(
+    State(server_state): State<Arc<Server>>,
+    Path((doc_id, timestamp)): Path<(String, String)>,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+) -> Result<StatusCode, AppError> {
+    if !validate_doc_name(doc_id.as_str()) {
+        return Err(AppError(StatusCode::BAD_REQUEST, anyhow!("Invalid document name")));
+    }
+    let token = get_token_from_header(auth_header);
+    let auth = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
+    if !matches!(auth, Authorization::Full) {
+        return Err(AppError(StatusCode::FORBIDDEN, anyhow!("Full auth required to rollback")));
+    }
+    server_state.rollback_to_snapshot(&doc_id, &timestamp).await?;
+    Ok(StatusCode::OK)
 }
 
 async fn update_doc_deprecated(
@@ -846,6 +1206,7 @@ mod test {
             true,
             None,
             false,
+            SnapshotConfig::default(),
         )
         .await
         .unwrap();
@@ -886,6 +1247,7 @@ mod test {
             true,
             None,
             false,
+            SnapshotConfig::default(),
         )
         .await
         .unwrap();

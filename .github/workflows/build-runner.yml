@@ -13,10 +13,13 @@ on:
     paths:
       - ".github/workflows/build-runner.yml"
       - ".github/workflows/runner.Dockerfile"
+  workflow_dispatch:
 
+# In a fork, pushes to your GHCR: ghcr.io/<your-username>/cicd-runner-base.
+# Override with Variables: REGISTRY, CICD_RUNNER_IMAGE (e.g. myorg/cicd-runner-base).
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: drifting-in-space/cicd-runner-base
+  REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
+  IMAGE_NAME: ${{ vars.CICD_RUNNER_IMAGE || format('{0}/cicd-runner-base', github.repository_owner) }}
 
 
 jobs:

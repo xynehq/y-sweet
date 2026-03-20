@@ -9,6 +9,7 @@ on:
       - "debugger/**"
       - "tests/**"
       - "js-pkg/**"
+  workflow_dispatch:
 
 jobs:
   check-ts-format:

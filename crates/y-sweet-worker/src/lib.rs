@@ -34,7 +34,7 @@ fn get_time_millis_since_epoch() -> u64 {
 pub fn router(
     context: ServerContext,
 ) -> std::result::Result<Router<'static, ServerContext>, Error> {
-    Ok(Router::with_data(context)
+    let mut r = Router::with_data(context)
         .get("/", |_, _| Response::ok("Y-Sweet!"))
         .get_async("/check_store", check_store_handler)
         .post_async("/check_store", check_store_handler)
@@ -42,7 +42,18 @@ pub fn router(
         .post_async("/doc/:doc_id/auth", auth_doc_handler)
         .get_async("/doc/:doc_id/as-update", as_update_handler)
         .post_async("/doc/:doc_id/update", update_handler)
-        .get_async("/doc/ws/:doc_id", forward_to_durable_object))
+        .get_async("/doc/ws/:doc_id", forward_to_durable_object)
+        .get_async("/doc/:doc_id/snapshots", snapshots_forward_handler)
+        .post_async("/doc/:doc_id/snapshots", snapshots_forward_handler)
+        .get_async(
+            "/doc/:doc_id/snapshots/:timestamp/as-update",
+            snapshots_forward_handler,
+        )
+        .post_async(
+            "/doc/:doc_id/snapshots/:timestamp/rollback",
+            snapshots_forward_handler,
+        );
+    Ok(r)
 }
 
 #[cfg(feature = "fetch-event")]
@@ -272,6 +283,19 @@ async fn auth_doc(
         doc_id: doc_id.to_string(),
         token,
     })
+}
+
+async fn snapshots_forward_handler(
+    req: Request,
+    mut ctx: RouteContext<ServerContext>,
+) -> Result<Response> {
+    let auth = ctx
+        .data
+        .auth()
+        .map_err(|_| worker::Error::JsError("Internal error".to_string()))?;
+    check_server_token(&req, auth).into_response()?;
+    let doc_id = ctx.param("doc_id").unwrap().to_string();
+    forward_to_durable_object_with_doc_id(req, ctx, &doc_id).await
 }
 
 async fn forward_to_durable_object(

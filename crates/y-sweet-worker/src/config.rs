@@ -14,6 +14,7 @@ const S3_REGION: &str = "AWS_REGION";
 const S3_ENDPOINT: &str = "AWS_ENDPOINT_URL_S3";
 const S3_BUCKET_PREFIX: &str = "S3_BUCKET_PREFIX";
 const S3_BUCKET_NAME: &str = "S3_BUCKET_NAME";
+const SNAPSHOTS_ENABLED: &str = "Y_SWEET_SNAPSHOTS_ENABLED";
 
 // Note: unlike the native server, the worker checkpoint frequency is not configurable because
 // it directly relates to Cloudflare platform configuration. Per their docs:
@@ -57,6 +58,8 @@ pub struct Configuration {
     pub bucket_prefix: Option<String>,
     pub url_prefix: Option<String>,
     pub timeout_interval: Duration,
+    /// Snapshots enabled (ENV: Y_SWEET_SNAPSHOTS_ENABLED, default false).
+    pub snapshots_enabled: bool,
 }
 
 fn parse_s3_config(env: &Env) -> anyhow::Result<S3Config> {
@@ -109,6 +112,11 @@ impl TryFrom<&Env> for Configuration {
             None
         };
 
+        let snapshots_enabled = env
+            .var(SNAPSHOTS_ENABLED)
+            .map(|v| v.to_string().to_lowercase() == "true" || v.to_string() == "1")
+            .unwrap_or(false);
+
         Ok(Self {
             auth_key,
             auth_key_id: None,
@@ -117,6 +125,7 @@ impl TryFrom<&Env> for Configuration {
             bucket_prefix: env.var(S3_BUCKET_PREFIX).map(|s| s.to_string()).ok(),
             url_prefix: None,
             timeout_interval,
+            snapshots_enabled,
         })
     }
 }

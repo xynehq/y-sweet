@@ -5,6 +5,7 @@ on:
     branches: [ "*" ]
     paths:
       - "crates/**"
+  workflow_dispatch:
 
 jobs:
   check-rust-format:

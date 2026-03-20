@@ -3,6 +3,7 @@ use crate::store::Store;
 use async_trait::async_trait;
 use bytes::Bytes;
 use reqwest::{Client, Method, Response, StatusCode, Url};
+use rusty_s3::actions::ListObjectsV2;
 use rusty_s3::{Bucket, Credentials, S3Action};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -197,6 +198,60 @@ impl S3Store {
             Err(e) => Err(e),
         }
     }
+
+    async fn list_prefix_impl(&self, prefix: &str) -> Result<Vec<String>> {
+        self.init().await?;
+        let prefixed_prefix = self.prefixed_key(prefix);
+        let mut keys_with_modified: Vec<(String, String)> = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        loop {
+            let mut action = ListObjectsV2::new(&self.bucket, Some(&self.credentials));
+            action.with_prefix(&prefixed_prefix);
+            if let Some(ref token) = continuation_token {
+                action.with_continuation_token(token);
+            }
+            let url = action.sign_with_time(PRESIGNED_URL_DURATION, &OffsetDateTime::now_utc());
+            let response = self
+                .client
+                .request(Method::GET, url)
+                .send()
+                .await
+                .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+            if !response.status().is_success() {
+                return Err(StoreError::ConnectionError(format!(
+                    "ListObjectsV2 returned {}",
+                    response.status()
+                )));
+            }
+            let body = response
+                .text()
+                .await
+                .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+            let list_result = ListObjectsV2::parse_response(&body).map_err(|e| {
+                StoreError::ConnectionError(format!("Parse ListObjectsV2 response: {}", e))
+            })?;
+            for obj in list_result.contents {
+                keys_with_modified.push((obj.key, obj.last_modified));
+            }
+            continuation_token = list_result.next_continuation_token;
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+        keys_with_modified.sort_by(|a, b| a.1.cmp(&b.1));
+        let prefix_len = self.prefix.as_deref().map(|p| p.len() + 1).unwrap_or(0);
+        let keys: Vec<String> = keys_with_modified
+            .into_iter()
+            .map(|(k, _)| {
+                if prefix_len > 0 && k.len() > prefix_len {
+                    k[prefix_len..].to_string()
+                } else {
+                    k
+                }
+            })
+            .collect();
+        Ok(keys)
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -221,6 +276,10 @@ impl Store for S3Store {
     async fn exists(&self, key: &str) -> Result<bool> {
         self.exists(key).await
     }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        self.list_prefix_impl(prefix).await
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -244,5 +303,9 @@ impl Store for S3Store {
 
     async fn exists(&self, key: &str) -> Result<bool> {
         self.exists(key).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        self.list_prefix_impl(prefix).await
     }
 }
