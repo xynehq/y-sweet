@@ -14,6 +14,7 @@ use tracing::metadata::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use url::Url;
 use y_sweet::cli::{print_auth_message, print_server_url};
+use y_sweet::metrics::spawn_metrics_logger;
 use y_sweet::stores::filesystem::FileSystemStore;
 use y_sweet_core::{
     auth::Authenticator,
@@ -225,6 +226,8 @@ async fn main() -> Result<()> {
             )
             .await?;
 
+            spawn_metrics_logger(server.metrics(), server.docs(), token.clone());
+
             let prod = *prod;
             let handle = tokio::spawn(async move {
                 server.serve(listener, prod).await.unwrap();
@@ -324,6 +327,8 @@ async fn main() -> Result<()> {
                 *skip_gc,
             )
             .await?;
+
+            spawn_metrics_logger(server.metrics(), server.docs(), cancellation_token.clone());
 
             // Load the one document we're operating with
             server

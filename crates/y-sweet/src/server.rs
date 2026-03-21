@@ -1,3 +1,4 @@
+use crate::metrics::Metrics;
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
@@ -94,6 +95,7 @@ pub struct Server {
     max_body_size: Option<usize>,
     /// Whether to skip garbage collection in Yrs documents.
     skip_gc: bool,
+    metrics: Arc<Metrics>,
 }
 
 impl Server {
@@ -118,7 +120,16 @@ impl Server {
             doc_gc,
             max_body_size,
             skip_gc,
+            metrics: Metrics::new(),
         })
+    }
+
+    pub fn metrics(&self) -> Arc<Metrics> {
+        self.metrics.clone()
+    }
+
+    pub fn docs(&self) -> Arc<DashMap<String, DocWithSyncKv>> {
+        self.docs.clone()
     }
 
     pub async fn doc_exists(&self, doc_id: &str) -> bool {
@@ -166,6 +177,7 @@ impl Server {
             let checkpoint_freq = self.checkpoint_freq;
             let doc_id = doc_id.to_string();
             let cancellation_token = self.cancellation_token.clone();
+            let metrics = self.metrics.clone();
 
             // Spawn a task to save the document to the store when it changes.
             self.doc_worker_tracker.spawn(
@@ -175,6 +187,7 @@ impl Server {
                     checkpoint_freq,
                     doc_id.clone(),
                     cancellation_token.clone(),
+                    metrics.clone(),
                 )
                 .instrument(span!(Level::INFO, "save_loop", doc_id=?doc_id)),
             );
@@ -186,6 +199,7 @@ impl Server {
                         doc_id.clone(),
                         checkpoint_freq,
                         cancellation_token,
+                        metrics,
                     )
                     .instrument(span!(Level::INFO, "gc_loop", doc_id=?doc_id)),
                 );
@@ -201,6 +215,7 @@ impl Server {
         doc_id: String,
         checkpoint_freq: Duration,
         cancellation_token: CancellationToken,
+        metrics: Arc<Metrics>,
     ) {
         let mut checkpoints_without_refs = 0;
 
@@ -227,6 +242,7 @@ impl Server {
                         }
 
                         docs.remove(&doc_id);
+                        metrics.inc_documents_gc();
                         break;
                     }
                 }
@@ -244,6 +260,7 @@ impl Server {
         checkpoint_freq: Duration,
         doc_id: String,
         cancellation_token: CancellationToken,
+        metrics: Arc<Metrics>,
     ) {
         let mut last_save = std::time::Instant::now();
 
@@ -284,10 +301,13 @@ impl Server {
                 }
             }
             tracing::info!("Persisting.");
+            let persist_start = std::time::Instant::now();
             if let Err(e) = sync_kv.persist().await {
                 tracing::error!(?e, "Error persisting.");
+                metrics.inc_persistence_errors();
             } else {
                 tracing::info!("Done persisting.");
+                metrics.record_persistence_op(persist_start.elapsed());
             }
             last_save = std::time::Instant::now();
 
@@ -305,6 +325,7 @@ impl Server {
         if !self.docs.contains_key(doc_id) {
             tracing::info!(doc_id=?doc_id, "Loading doc");
             self.load_doc(doc_id).await?;
+            self.metrics.inc_documents_loaded();
         }
 
         Ok(self
@@ -345,6 +366,7 @@ impl Server {
     pub fn routes(self: &Arc<Self>) -> Router {
         Router::new()
             .route("/ready", get(ready))
+            .route("/metrics", get(get_metrics))
             .route("/check_store", post(check_store))
             .route("/check_store", get(check_store_deprecated))
             .route("/doc/ws/:doc_id", get(handle_socket_upgrade_deprecated))
@@ -512,10 +534,12 @@ async fn update_doc_inner(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    let start = std::time::Instant::now();
     if let Err(err) = dwskv.apply_update(&body) {
         tracing::error!(?err, "Failed to apply update");
         return Err(AppError(StatusCode::INTERNAL_SERVER_ERROR, err));
     }
+    server_state.metrics.record_http_update(start.elapsed());
 
     Ok(StatusCode::OK.into_response())
 }
@@ -551,9 +575,10 @@ async fn handle_socket_upgrade(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let awareness = dwskv.awareness();
     let cancellation_token = server_state.cancellation_token.clone();
+    let metrics = server_state.metrics.clone();
 
     Ok(ws.on_upgrade(move |socket| {
-        handle_socket(socket, awareness, authorization, cancellation_token)
+        handle_socket(socket, awareness, authorization, cancellation_token, metrics)
     }))
 }
 
@@ -611,12 +636,15 @@ async fn handle_socket(
     awareness: Arc<RwLock<Awareness>>,
     authorization: Authorization,
     cancellation_token: CancellationToken,
+    metrics: Arc<Metrics>,
 ) {
+    metrics.inc_connections();
     let (mut sink, mut stream) = socket.split();
     let (send, mut recv) = channel(1024);
 
     let last_pong = Arc::new(RwLock::new(tokio::time::Instant::now()));
     let last_pong_clone = last_pong.clone();
+    let pong_timeout_metrics = metrics.clone();
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(PING_EVERY);
@@ -633,6 +661,7 @@ async fn handle_socket(
                 _ = ticker.tick() => {
                     if last_pong_clone.read().expect("Failed to get read lock on last_pong").elapsed() > PONG_TIMEOUT {
                         tracing::info!("Pong timeout, closing connection");
+                        pong_timeout_metrics.inc_pong_timeouts();
                         break;
                     }
                     let _ = sink.send(Message::Ping(vec![])).await;
@@ -663,6 +692,7 @@ async fn handle_socket(
                     Err(_e) => {
                         // The stream will complain about things like
                         // connections being lost without handshake.
+                        metrics.inc_websocket_failures();
                         continue;
                     }
                     msg => {
@@ -671,9 +701,11 @@ async fn handle_socket(
                     }
                 };
 
+                let start = std::time::Instant::now();
                 if let Err(e) = connection.send(&msg).await {
                     tracing::warn!(?e, "Error handling message");
                 }
+                metrics.record_sync_update(start.elapsed());
             }
             _ = cancellation_token.cancelled() => {
                 tracing::debug!("Closing doc connection due to server cancel...");
@@ -681,6 +713,8 @@ async fn handle_socket(
             }
         }
     }
+
+    metrics.dec_connections();
 }
 
 async fn check_store(
@@ -711,6 +745,16 @@ async fn check_store_deprecated(
 /// Always returns a 200 OK response, as long as we are listening.
 async fn ready() -> Result<Json<Value>, AppError> {
     Ok(Json(json!({"ok": true})))
+}
+
+async fn get_metrics(State(server_state): State<Arc<Server>>) -> impl IntoResponse {
+    let active_docs = server_state.docs.len() as u64;
+    let snap = server_state.metrics.snapshot(active_docs);
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        snap.to_prometheus(),
+    )
 }
 
 async fn new_doc(
