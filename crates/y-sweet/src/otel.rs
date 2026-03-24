@@ -1,5 +1,5 @@
 use opentelemetry::KeyValue;
-use opentelemetry_otlp::MetricExporter;
+use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::Resource;
 use std::time::Duration;
@@ -16,9 +16,9 @@ pub fn init_meter_provider(
     service_name: &str,
     push_interval: Duration,
 ) -> SdkMeterProvider {
-    let resource = Resource::new(vec![
-        KeyValue::new("service.name", service_name.to_string()),
-    ]);
+    let resource = Resource::builder()
+        .with_attribute(KeyValue::new("service.name", service_name.to_string()))
+        .build();
 
     let provider = if let Some(endpoint) = endpoint {
         let exporter = MetricExporter::builder()
