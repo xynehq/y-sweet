@@ -810,11 +810,14 @@ async fn auth_doc(
     };
 
     let url = if let Some(url_prefix) = &server_state.url_prefix {
-        let mut url = url_prefix.clone();
-        let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
-        url.set_scheme(scheme).unwrap();
-        url = url.join(&format!("/d/{doc_id}/ws")).unwrap();
-        url.to_string()
+        let mut url_prefix = url_prefix.clone();
+        let scheme = if url_prefix.scheme() == "https" { "wss" } else { "ws" };
+        url_prefix.set_scheme(scheme).unwrap();
+        let mut url_str = url_prefix.to_string();
+        if !url_str.ends_with('/') {
+            url_str.push('/');
+        }
+        format!("{url_str}d/{doc_id}/ws")
     } else {
         format!("ws://{host}/d/{doc_id}/ws")
     };
@@ -941,6 +944,44 @@ mod test {
 
         let expected_url = format!("wss://foo.bar/d/{doc_id}/ws");
         assert_eq!(token.url, expected_url);
+        assert_eq!(token.doc_id, doc_id);
+        assert!(token.token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_auth_doc_with_prefix_and_path() {
+        let prefix: Url = "https://foo.bar/my-prefix".parse().unwrap();
+        let server_state = Server::new(
+            None,
+            Duration::from_secs(60),
+            None,
+            Some(prefix),
+            CancellationToken::new(),
+            true,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let doc_id = server_state.create_doc().await.unwrap();
+
+        let token = auth_doc(
+            None,
+            TypedHeader(headers::Host::from(http::uri::Authority::from_static(
+                "localhost",
+            ))),
+            State(Arc::new(server_state)),
+            Path(doc_id.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let expected_url = format!("wss://foo.bar/my-prefix/d/{doc_id}/ws");
+        assert_eq!(token.url, expected_url);
+        let expected_base_url = format!("https://foo.bar/my-prefix/d/{doc_id}");
+        assert_eq!(token.base_url, Some(expected_base_url));
         assert_eq!(token.doc_id, doc_id);
         assert!(token.token.is_none());
     }
