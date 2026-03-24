@@ -143,7 +143,7 @@ impl Server {
     pub async fn create_doc(&self) -> Result<String> {
         let doc_id = nanoid::nanoid!();
         self.load_doc(&doc_id).await?;
-        tracing::info!(doc_id=?doc_id, "Created doc");
+        tracing::info!(doc_id=%doc_id, "Created doc");
         Ok(doc_id)
     }
 
@@ -184,7 +184,7 @@ impl Server {
                     cancellation_token.clone(),
                     metrics.clone(),
                 )
-                .instrument(span!(Level::INFO, "save_loop", doc_id=?doc_id)),
+                .instrument(span!(Level::INFO, "save_loop", doc_id=%doc_id)),
             );
 
             if self.doc_gc {
@@ -196,7 +196,7 @@ impl Server {
                         cancellation_token,
                         metrics,
                     )
-                    .instrument(span!(Level::INFO, "gc_loop", doc_id=?doc_id)),
+                    .instrument(span!(Level::INFO, "gc_loop", doc_id=%doc_id)),
                 );
             }
         }
@@ -320,7 +320,7 @@ impl Server {
         doc_id: &str,
     ) -> Result<MappedRef<String, DocWithSyncKv, DocWithSyncKv>> {
         if !self.docs.contains_key(doc_id) {
-            tracing::info!(doc_id=?doc_id, "Loading doc");
+            tracing::info!(doc_id=%doc_id, "Loading doc");
             self.load_doc(doc_id).await?;
             self.metrics.documents_loaded.add(1, &[]);
         }

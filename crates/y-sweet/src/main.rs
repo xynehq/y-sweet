@@ -185,7 +185,7 @@ async fn main() -> Result<()> {
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().json())
+        .with(tracing_subscriber::fmt::layer().json().flatten_event(true))
         .with(filter)
         .init();
 

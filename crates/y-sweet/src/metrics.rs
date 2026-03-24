@@ -79,16 +79,22 @@ impl Metrics {
                 .with_description("Failed persistence operations")
                 .build(),
             sync_latency_ms: meter
-                .f64_histogram("y_sweet_sync_latency_ms")
+                .f64_histogram("y_sweet_sync_latency")
                 .with_description("Sync update processing latency in milliseconds")
+                .with_unit("ms")
+                .with_boundaries(vec![0.0, 0.001, 0.01, 0.1, 0.3, 0.5, 1.0, 5.0, 10.0, 50.0, 250.0, 1000.0])
                 .build(),
             http_latency_ms: meter
-                .f64_histogram("y_sweet_http_latency_ms")
+                .f64_histogram("y_sweet_http_latency")
                 .with_description("HTTP update processing latency in milliseconds")
+                .with_unit("ms")
+                .with_boundaries(vec![0.0, 0.001, 0.01, 0.1, 0.3, 0.5, 1.0, 5.0, 10.0, 50.0, 250.0, 1000.0])
                 .build(),
             persistence_latency_ms: meter
-                .f64_histogram("y_sweet_persistence_latency_ms")
+                .f64_histogram("y_sweet_persistence_latency")
                 .with_description("Persistence latency in milliseconds")
+                .with_unit("ms")
+                .with_boundaries(vec![0.0, 0.001, 0.01, 0.1, 0.3, 0.5, 1.0, 5.0, 10.0, 50.0, 250.0, 1000.0])
                 .build(),
         }
     }
