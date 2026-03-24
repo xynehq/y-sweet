@@ -24,8 +24,11 @@ serde_json = "1.0.103"
 tokio = { version = "1.29.1", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-stream = "0.1.14"
 tokio-util = { version = "0.7.11", features = ["rt"] }
+opentelemetry = "0.28"
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio", "metrics"] }
+opentelemetry-otlp = { version = "0.28", features = ["http-proto", "metrics"] }
 tracing = "0.1.37"
-tracing-subscriber = { version = "0.3.17", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.17", features = ["env-filter", "fmt", "json"] }
 url = "2.4.0"
 y-sweet-core = { version = "0.9.1", path = "../y-sweet-core", features=["sync"] }
 yrs = { version = "0.19.1" }

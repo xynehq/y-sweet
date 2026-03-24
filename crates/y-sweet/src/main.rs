@@ -14,7 +14,6 @@ use tracing::metadata::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use url::Url;
 use y_sweet::cli::{print_auth_message, print_server_url};
-use y_sweet::metrics::spawn_metrics_logger;
 use y_sweet::stores::filesystem::FileSystemStore;
 use y_sweet_core::{
     auth::Authenticator,
@@ -60,6 +59,15 @@ enum ServSubcommand {
 
         #[clap(long, default_value = "false", env = "Y_SWEET_SKIP_GC")]
         skip_gc: bool,
+
+        #[clap(long, env = "Y_SWEET_OTEL_ENDPOINT")]
+        otel_endpoint: Option<String>,
+
+        #[clap(long, default_value = "y-sweet", env = "Y_SWEET_OTEL_SERVICE_NAME")]
+        otel_service_name: String,
+
+        #[clap(long, default_value = "30", env = "Y_SWEET_OTEL_PUSH_INTERVAL")]
+        otel_push_interval_secs: u64,
     },
 
     GenAuth {
@@ -95,6 +103,15 @@ enum ServSubcommand {
 
         #[clap(long, default_value = "false", env = "Y_SWEET_SKIP_GC")]
         skip_gc: bool,
+
+        #[clap(long, env = "Y_SWEET_OTEL_ENDPOINT")]
+        otel_endpoint: Option<String>,
+
+        #[clap(long, default_value = "y-sweet", env = "Y_SWEET_OTEL_SERVICE_NAME")]
+        otel_service_name: String,
+
+        #[clap(long, default_value = "30", env = "Y_SWEET_OTEL_PUSH_INTERVAL")]
+        otel_push_interval_secs: u64,
     },
 }
 
@@ -168,7 +185,7 @@ async fn main() -> Result<()> {
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().json())
         .with(filter)
         .init();
 
@@ -183,7 +200,15 @@ async fn main() -> Result<()> {
             prod,
             max_body_size,
             skip_gc,
+            otel_endpoint,
+            otel_service_name,
+            otel_push_interval_secs,
         } => {
+            let meter_provider = y_sweet::otel::init_meter_provider(
+                otel_endpoint.as_deref(),
+                otel_service_name,
+                std::time::Duration::from_secs(*otel_push_interval_secs),
+            );
             let auth = if let Some(auth) = auth {
                 Some(Authenticator::new(auth)?)
             } else {
@@ -226,8 +251,6 @@ async fn main() -> Result<()> {
             )
             .await?;
 
-            spawn_metrics_logger(server.metrics(), server.docs(), token.clone());
-
             let prod = *prod;
             let handle = tokio::spawn(async move {
                 server.serve(listener, prod).await.unwrap();
@@ -243,6 +266,9 @@ async fn main() -> Result<()> {
             token.cancel();
 
             handle.await?;
+            if let Err(e) = meter_provider.shutdown() {
+                tracing::error!(?e, "Error shutting down OTel meter provider");
+            }
             tracing::info!("Server shut down.");
         }
         ServSubcommand::GenAuth { json } => {
@@ -278,7 +304,16 @@ async fn main() -> Result<()> {
             checkpoint_freq_seconds,
             max_body_size,
             skip_gc,
+            otel_endpoint,
+            otel_service_name,
+            otel_push_interval_secs,
         } => {
+            let meter_provider = y_sweet::otel::init_meter_provider(
+                otel_endpoint.as_deref(),
+                otel_service_name,
+                std::time::Duration::from_secs(*otel_push_interval_secs),
+            );
+
             let doc_id = env::var("SESSION_BACKEND_KEY").expect("SESSION_BACKEND_KEY must be set");
 
             let store = if let Ok(bucket) = env::var("STORAGE_BUCKET") {
@@ -328,8 +363,6 @@ async fn main() -> Result<()> {
             )
             .await?;
 
-            spawn_metrics_logger(server.metrics(), server.docs(), cancellation_token.clone());
-
             // Load the one document we're operating with
             server
                 .load_doc(&doc_id)
@@ -372,6 +405,9 @@ async fn main() -> Result<()> {
             }
 
             cancellation_token.cancel();
+            if let Err(e) = meter_provider.shutdown() {
+                tracing::error!(?e, "Error shutting down OTel meter provider");
+            }
             tracing::info!("Server shut down.");
         }
     }
