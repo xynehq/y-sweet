@@ -1,13 +1,19 @@
-use super::{Result, StoreError};
+use super::{Result, StoreError, VersionInfo};
 use crate::store::Store;
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use data_encoding::HEXLOWER;
+use hmac::{Hmac, Mac};
 use reqwest::{Client, Method, Response, StatusCode, Url};
 use rusty_s3::{Bucket, Credentials, S3Action};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use std::time::Duration;
 use time::OffsetDateTime;
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct S3Config {
@@ -31,6 +37,24 @@ pub struct S3Store {
     client: Client,
     credentials: Credentials,
     prefix: Option<String>,
+}
+
+/// Response from S3 ListObjectVersions API
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ListVersionsResponse {
+    #[serde(default)]
+    version: Vec<ObjectVersion>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ObjectVersion {
+    key: String,
+    version_id: String,
+    is_latest: bool,
+    last_modified: String,
+    size: i64,
 }
 
 impl S3Store {
@@ -197,6 +221,209 @@ impl S3Store {
             Err(e) => Err(e),
         }
     }
+
+    // -------------------------------------------------------------------------
+    // AWS Signature Version 4 – presigned GET URL
+    //
+    // rusty-s3 0.5 has no `ListObjectVersions` action and `Credentials` has no
+    // standalone `sign` method. We implement SigV4 query-string auth ourselves
+    // using the `sha2` + `hmac` crates that are already in the dependency tree.
+    // The resulting presigned URL works with MinIO (local dev), AWS S3, and
+    // GCS's S3-compatible API.
+    // -------------------------------------------------------------------------
+    fn sign_v4_presigned_get(&self, base_url: &Url, expires_secs: u64) -> Url {
+        let now = Utc::now();
+        let date = now.format("%Y%m%d").to_string();
+        let datetime = now.format("%Y%m%dT%H%M%SZ").to_string();
+
+        let region = self.bucket.region();
+        let access_key = self.credentials.key();
+        let secret_key = self.credentials.secret();
+
+        // Host header value (include non-default port, e.g. "minio:9000")
+        let host = match (base_url.host_str(), base_url.port()) {
+            (Some(h), Some(p)) => format!("{}:{}", h, p),
+            (Some(h), None) => h.to_string(),
+            _ => String::new(),
+        };
+
+        // Canonical URI: percent-encode each path segment but preserve '/'
+        let raw_path = base_url.path();
+        let canonical_uri: String = if raw_path.is_empty() {
+            "/".to_string()
+        } else {
+            raw_path
+                .split('/')
+                .map(|seg| urlencoding::encode(seg).into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+
+        // Credential scope
+        let credential_scope = format!("{}/{}/s3/aws4_request", date, region);
+
+        // Collect existing query params from the URL (already decoded by url crate)
+        let mut params: Vec<(String, String)> = base_url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+
+        // Append required X-Amz-* signing parameters (unencoded; we encode below)
+        params.push(("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()));
+        params.push((
+            "X-Amz-Credential".into(),
+            format!("{}/{}", access_key, credential_scope),
+        ));
+        params.push(("X-Amz-Date".into(), datetime.clone()));
+        params.push(("X-Amz-Expires".into(), expires_secs.to_string()));
+        params.push(("X-Amz-SignedHeaders".into(), "host".into()));
+        if let Some(token) = self.credentials.token() {
+            params.push(("X-Amz-Security-Token".into(), token.to_string()));
+        }
+
+        // Sort by URI-encoded key (byte order), as required by SigV4
+        params.sort_by(|a, b| {
+            urlencoding::encode(&a.0).cmp(&urlencoding::encode(&b.0))
+        });
+
+        // Canonical query string: every key and value is RFC-3986 percent-encoded
+        let canonical_query: String = params
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "{}={}",
+                    urlencoding::encode(k),
+                    urlencoding::encode(v)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+
+        // Canonical headers (only "host" for presigned-URL style)
+        let canonical_headers = format!("host:{}\n", host);
+        let signed_headers = "host";
+
+        // Canonical request
+        let canonical_request = format!(
+            "GET\n{}\n{}\n{}\n{}\nUNSIGNED-PAYLOAD",
+            canonical_uri, canonical_query, canonical_headers, signed_headers
+        );
+
+        // String to sign
+        let cr_hash = HEXLOWER.encode(Sha256::digest(canonical_request.as_bytes()).as_ref());
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+            datetime, credential_scope, cr_hash
+        );
+
+        // Derive signing key: HMAC(HMAC(HMAC(HMAC("AWS4"+secret, date), region), "s3"), "aws4_request")
+        let hmac_sha256 = |key: &[u8], data: &[u8]| -> Vec<u8> {
+            let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+            mac.update(data);
+            mac.finalize().into_bytes().to_vec()
+        };
+
+        let k_date = hmac_sha256(format!("AWS4{}", secret_key).as_bytes(), date.as_bytes());
+        let k_region = hmac_sha256(&k_date, region.as_bytes());
+        let k_service = hmac_sha256(&k_region, b"s3");
+        let k_signing = hmac_sha256(&k_service, b"aws4_request");
+        let signature = HEXLOWER.encode(&hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+
+        // Build final URL: canonical query + X-Amz-Signature appended at the end
+        let final_query = format!("{}&X-Amz-Signature={}", canonical_query, signature);
+        let mut signed_url = base_url.clone();
+        signed_url.set_query(Some(&final_query));
+        signed_url
+    }
+
+    // -------------------------------------------------------------------------
+    // List all versions of a document key using S3 ListObjectVersions API.
+    // rusty-s3 has no native action for this, so we build + sign the URL using
+    // our SigV4 implementation above.
+    // -------------------------------------------------------------------------
+    async fn list_versions_impl(&self, key: &str) -> Result<Vec<VersionInfo>> {
+        self.init().await?;
+        let prefixed_key = self.prefixed_key(key);
+
+        // Build the ListObjectVersions URL: bucket base URL + ?versions&prefix=…
+        let mut url = self.bucket.base_url().clone();
+        url.query_pairs_mut()
+            .append_pair("versions", "")
+            .append_pair("prefix", &prefixed_key);
+
+        let signed_url = self.sign_v4_presigned_get(&url, PRESIGNED_URL_DURATION.as_secs());
+
+        let response = self
+            .client
+            .get(signed_url)
+            .send()
+            .await
+            .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(StoreError::ConnectionError(format!(
+                "ListObjectVersions failed: HTTP {}",
+                response.status()
+            )));
+        }
+
+        let body = response
+            .text()
+            .await
+            .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+
+        // Parse the XML response (ListVersionsResult)
+        let parsed: ListVersionsResponse = quick_xml::de::from_str(&body).map_err(|e| {
+            StoreError::ConnectionError(format!("Failed to parse ListObjectVersions XML: {}", e))
+        })?;
+
+        let versions = parsed
+            .version
+            .into_iter()
+            .filter(|v| v.key == prefixed_key)
+            .map(|v| {
+                let last_modified = DateTime::parse_from_rfc3339(&v.last_modified)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+
+                VersionInfo {
+                    version_id: v.version_id,
+                    last_modified,
+                    size: v.size as usize,
+                    is_latest: v.is_latest,
+                }
+            })
+            .collect();
+
+        Ok(versions)
+    }
+
+    // -------------------------------------------------------------------------
+    // Retrieve a specific version of an object.
+    // Uses rusty-s3's GetObject action with `versionId` inserted into the
+    // query-string BEFORE signing, so the signature covers the versionId param.
+    // -------------------------------------------------------------------------
+    async fn get_version_impl(&self, key: &str, version_id: &str) -> Result<Option<Vec<u8>>> {
+        self.init().await?;
+        let prefixed_key = self.prefixed_key(key);
+
+        // Use rusty-s3's GetObject action and add versionId to the query before signing
+        let mut action = self
+            .bucket
+            .get_object(Some(&self.credentials), &prefixed_key);
+        action.query_mut().insert("versionId", version_id);
+
+        let response = self.store_request(Method::GET, action, None).await;
+
+        match response {
+            Ok(response) => {
+                let result = Self::read_response_bytes(response).await?;
+                Ok(Some(result.to_vec()))
+            }
+            Err(StoreError::DoesNotExist(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -221,6 +448,14 @@ impl Store for S3Store {
     async fn exists(&self, key: &str) -> Result<bool> {
         self.exists(key).await
     }
+
+    async fn list_versions(&self, key: &str) -> Result<Vec<VersionInfo>> {
+        self.list_versions_impl(key).await
+    }
+
+    async fn get_version(&self, key: &str, version_id: &str) -> Result<Option<Vec<u8>>> {
+        self.get_version_impl(key, version_id).await
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -244,5 +479,13 @@ impl Store for S3Store {
 
     async fn exists(&self, key: &str) -> Result<bool> {
         self.exists(key).await
+    }
+
+    async fn list_versions(&self, key: &str) -> Result<Vec<VersionInfo>> {
+        self.list_versions_impl(key).await
+    }
+
+    async fn get_version(&self, key: &str, version_id: &str) -> Result<Option<Vec<u8>>> {
+        self.get_version_impl(key, version_id).await
     }
 }

@@ -39,10 +39,11 @@ use y_sweet_core::{
     auth::{Authenticator, ExpirationTimeEpochMillis, DEFAULT_EXPIRATION_SECONDS},
     doc_connection::DocConnection,
     doc_sync::DocWithSyncKv,
-    store::Store,
+    store::{Store, VersionInfo},
     sync::awareness::Awareness,
     sync_kv::SyncKv,
 };
+use serde::Serialize;
 
 const PLANE_VERIFIED_USER_DATA_HEADER: &str = "x-verified-user-data";
 
@@ -372,6 +373,8 @@ impl Server {
             .route("/doc/:doc_id/update", post(update_doc_deprecated))
             .route("/d/:doc_id/as-update", get(get_doc_as_update))
             .route("/d/:doc_id/update", post(update_doc))
+            .route("/d/:doc_id/versions", get(list_doc_versions))
+            .route("/d/:doc_id/versions/:version_id/as-update", get(get_doc_version_as_update))
             .route(
                 "/d/:doc_id/ws/:doc_id2",
                 get(handle_socket_upgrade_full_path),
@@ -865,6 +868,94 @@ fn get_authorization_from_plane_header(headers: HeaderMap) -> Result<Authorizati
         Ok(user_data.authorization)
     } else {
         Err((StatusCode::UNAUTHORIZED, anyhow!("No token provided.")))?
+    }
+}
+
+/// JSON-serializable version info for API responses
+#[derive(Serialize)]
+struct VersionInfoResponse {
+    version_id: String,
+    last_modified: String,
+    size: usize,
+    is_latest: bool,
+}
+
+/// List all versions of a document
+async fn list_doc_versions(
+    State(server_state): State<Arc<Server>>,
+    Path(doc_id): Path<String>,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+) -> Result<Json<Vec<VersionInfoResponse>>, AppError> {
+    let token = get_token_from_header(auth_header);
+    let _ = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
+
+    let store = server_state
+        .store
+        .as_ref()
+        .ok_or_else(|| AppError(StatusCode::SERVICE_UNAVAILABLE, anyhow!("No store configured")))?;
+
+    let key = format!("{}/data.ysweet", doc_id);
+    let versions = store
+        .list_versions(&key)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let response: Vec<VersionInfoResponse> = versions
+        .into_iter()
+        .map(|v| VersionInfoResponse {
+            version_id: v.version_id,
+            last_modified: v.last_modified.to_rfc3339(),
+            size: v.size,
+            is_latest: v.is_latest,
+        })
+        .collect();
+
+    Ok(Json(response))
+}
+
+/// Get a specific version of a document as an update
+async fn get_doc_version_as_update(
+    State(server_state): State<Arc<Server>>,
+    Path((doc_id, version_id)): Path<(String, String)>,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+) -> Result<Response, AppError> {
+    let token = get_token_from_header(auth_header);
+    let _ = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
+
+    let store = server_state
+        .store
+        .as_ref()
+        .ok_or_else(|| AppError(StatusCode::SERVICE_UNAVAILABLE, anyhow!("No store configured")))?;
+
+    let key = format!("{}/data.ysweet", doc_id);
+    
+    tracing::info!(doc_id=%doc_id, version_id=%version_id, key=%key, "Fetching version");
+    
+    let data = store
+        .get_version(&key, &version_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(doc_id=%doc_id, version_id=%version_id, error=?e, "Failed to get version from store");
+            AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to get version: {}", e))
+        })?;
+
+    match data {
+        Some(bytes) => {
+            tracing::info!(doc_id=%doc_id, version_id=%version_id, bytes_len=bytes.len(), "Got version data, converting to update");
+            
+            // Convert the stored data (yrs_kvstore format) to a Yjs update
+            // by loading it into a temporary Y.Doc and exporting as update
+            let update = crate::convert::store_data_to_update(&bytes)
+                .map_err(|e| {
+                    tracing::error!(doc_id=%doc_id, version_id=%version_id, error=?e, "Failed to convert version to update");
+                    AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow!("Failed to convert version to update: {}", e))
+                })?;
+            Ok(update.into_response())
+        },
+        None => {
+            tracing::warn!(doc_id=%doc_id, version_id=%version_id, "Version not found");
+            Err(AppError(StatusCode::NOT_FOUND, anyhow!("Version not found")))
+        },
     }
 }
 
