@@ -59,6 +59,13 @@ pub const DEFAULT_VALIDATE_POLL_EVERY: Duration = Duration::from_secs(10);
 pub const DEFAULT_VALIDATE_RETRY_ATTEMPTS: u32 = 3;
 pub const DEFAULT_VALIDATE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+const CONNECT_VALIDATE_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+];
+
 fn current_time_epoch_millis() -> u64 {
     let now = std::time::SystemTime::now();
     let duration_since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
@@ -117,6 +124,10 @@ pub struct Server {
     skip_gc: bool,
     metrics: Metrics,
     backend_url: Option<String>,
+    /// Shared secret sent as `Authorization: Bearer <token>` on every call to
+    /// the backend's `/api/ysweet/validate`, so the backend can confirm the
+    /// caller is actually y-sweet and not just anyone hitting that route.
+    server_token: Option<String>,
     http_client: reqwest::Client,
     validate_poll_every: Duration,
     validate_retry_attempts: u32,
@@ -136,6 +147,7 @@ impl Server {
         max_body_size: Option<usize>,
         skip_gc: bool,
         backend_url: Option<String>,
+        server_token: Option<String>,
         validate_poll_every: Duration,
         validate_retry_attempts: u32,
         validate_retry_delay: Duration,
@@ -145,6 +157,11 @@ impl Server {
         if backend_url.is_none() {
             tracing::warn!(
                 "Y_SWEET_BACKEND_URL is not set. All access-validated requests will be denied."
+            );
+        }
+        if backend_url.is_some() && server_token.is_none() {
+            tracing::warn!(
+                "Y_SWEET_SERVER_TOKEN is not set. Calls to the backend's validate endpoint will be unauthenticated."
             );
         }
         Ok(Self {
@@ -163,6 +180,7 @@ impl Server {
             skip_gc,
             metrics,
             backend_url,
+            server_token,
             http_client: reqwest::Client::new(),
             validate_poll_every,
             validate_retry_attempts,
@@ -170,21 +188,31 @@ impl Server {
         })
     }
 
-    /// Calls the Xyne backend to check whether `user_id` currently has access
-    /// to `doc_id`. Fails closed (denies) if the backend is unconfigured,
-    /// unreachable, or returns a non-2xx response.
-    async fn validate_user_access(&self, doc_id: &str, user_id: &str) -> bool {
+    /// Calls the Xyne backend to check whether `user_id` currently has the
+    /// given `authorization` level of access to `doc_id` — full (edit) or
+    /// read-only — so a user downgraded from editor to viewer gets caught
+    /// here even though they still technically have *some* access. Fails
+    /// closed (denies) if the backend is unconfigured, unreachable, or
+    /// returns a non-2xx response.
+    async fn validate_user_access(
+        &self,
+        doc_id: &str,
+        user_id: &str,
+        authorization: &Authorization,
+    ) -> bool {
         let Some(backend_url) = &self.backend_url else {
             return false;
         };
         let url = format!("{}/api/ysweet/validate", backend_url.trim_end_matches('/'));
-        match self
-            .http_client
-            .post(&url)
-            .json(&serde_json::json!({ "docId": doc_id, "userId": user_id }))
-            .send()
-            .await
-        {
+        let mut req = self.http_client.post(&url).json(&serde_json::json!({
+            "docId": doc_id,
+            "userId": user_id,
+            "authorization": authorization,
+        }));
+        if let Some(token) = &self.server_token {
+            req = req.bearer_auth(token);
+        }
+        match req.send().await {
             Ok(resp) => resp.status().is_success(),
             Err(e) => {
                 tracing::error!(?e, doc_id = %doc_id, user_id = %user_id, "Failed to reach backend for access validation");
@@ -197,13 +225,41 @@ impl Server {
     /// errors, backend hiccups) up to `VALIDATE_RETRY_ATTEMPTS` times before
     /// treating the check as a real denial. Used by the periodic mid-session
     /// poll, where a brief backend blip shouldn't kick an otherwise-valid user.
-    async fn validate_user_access_with_retry(&self, doc_id: &str, user_id: &str) -> bool {
+    async fn validate_user_access_with_retry(
+        &self,
+        doc_id: &str,
+        user_id: &str,
+        authorization: &Authorization,
+    ) -> bool {
         for attempt in 1..=self.validate_retry_attempts {
-            if self.validate_user_access(doc_id, user_id).await {
+            if self.validate_user_access(doc_id, user_id, authorization).await {
                 return true;
             }
             if attempt < self.validate_retry_attempts {
                 tokio::time::sleep(self.validate_retry_delay).await;
+            }
+        }
+        false
+    }
+
+    /// Like `validate_user_access`, but used for the connect-time check
+    /// (WS upgrade, as-update, etc). Retries on a fixed backoff schedule to
+    /// ride out read-replica lag right after a canvas is created or a
+    /// participant is added, since that check only gets one shot before the
+    /// connection is refused.
+    async fn validate_user_access_with_connect_retry(
+        &self,
+        doc_id: &str,
+        user_id: &str,
+        authorization: &Authorization,
+    ) -> bool {
+        if self.validate_user_access(doc_id, user_id, authorization).await {
+            return true;
+        }
+        for delay in CONNECT_VALIDATE_RETRY_DELAYS {
+            tokio::time::sleep(delay).await;
+            if self.validate_user_access(doc_id, user_id, authorization).await {
+                return true;
             }
         }
         false
@@ -802,6 +858,7 @@ async fn handle_socket(
         let server_state_poll = server_state.clone();
         let doc_id_poll = doc_id.clone();
         let conn_cancel_poll = conn_cancel.clone();
+        let authorization_poll = authorization.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(server_state_poll.validate_poll_every);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -812,7 +869,7 @@ async fn handle_socket(
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        if !server_state_poll.validate_user_access_with_retry(&doc_id_poll, &user_id).await {
+                        if !server_state_poll.validate_user_access_with_retry(&doc_id_poll, &user_id, &authorization_poll).await {
                             tracing::info!(doc_id = %doc_id_poll, user_id = %user_id, "Access revoked mid-session; closing connection");
                             conn_cancel_poll.cancel();
                             break;
@@ -1027,7 +1084,7 @@ async fn validate_user_middleware(
     let token = extract_request_token(&req)
         .ok_or_else(|| AppError(StatusCode::FORBIDDEN, anyhow!("Missing token")))?;
 
-    let (_authorization, user_id) = server_state.verify_doc_token(Some(&token), &doc_id)?;
+    let (authorization, user_id) = server_state.verify_doc_token(Some(&token), &doc_id)?;
 
     let Some(user_id) = user_id else {
         return Err(AppError(
@@ -1036,7 +1093,10 @@ async fn validate_user_middleware(
         ));
     };
 
-    if !server_state.validate_user_access(&doc_id, &user_id).await {
+    if !server_state
+        .validate_user_access_with_connect_retry(&doc_id, &user_id, &authorization)
+        .await
+    {
         return Err(AppError(StatusCode::FORBIDDEN, anyhow!("Access denied")));
     }
 

@@ -47,6 +47,9 @@ enum ServSubcommand {
         #[clap(long, env = "Y_SWEET_BACKEND_URL")]
         backend_url: Option<String>,
 
+        #[clap(long, env = "Y_SWEET_SERVER_TOKEN")]
+        server_token: Option<String>,
+
         #[clap(long, default_value = "10", env = "Y_SWEET_VALIDATE_POLL_SECONDS")]
         validate_poll_seconds: u64,
 
@@ -209,6 +212,7 @@ async fn main() -> Result<()> {
             store,
             auth,
             backend_url,
+            server_token,
             validate_poll_seconds,
             validate_retry_attempts,
             validate_retry_delay_ms,
@@ -267,6 +271,7 @@ async fn main() -> Result<()> {
                 *max_body_size,
                 *skip_gc,
                 backend_url.clone(),
+                server_token.clone(),
                 std::time::Duration::from_secs(*validate_poll_seconds),
                 *validate_retry_attempts,
                 std::time::Duration::from_millis(*validate_retry_delay_ms),
@@ -383,6 +388,7 @@ async fn main() -> Result<()> {
                 *max_body_size,
                 *skip_gc,
                 None, // No backend URL in single-doc mode
+                None, // No server token in single-doc mode
                 y_sweet::server::DEFAULT_VALIDATE_POLL_EVERY,
                 y_sweet::server::DEFAULT_VALIDATE_RETRY_ATTEMPTS,
                 y_sweet::server::DEFAULT_VALIDATE_RETRY_DELAY,
