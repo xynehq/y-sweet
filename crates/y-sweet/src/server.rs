@@ -21,6 +21,7 @@ use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -51,6 +52,19 @@ const PING_EVERY: Duration = Duration::from_secs(20);
 // If we haven't received a pong in the last 40 seconds, we close the connection.
 // All modern browsers will respond to websocket pings with a pong message.
 const PONG_TIMEOUT: Duration = Duration::from_secs(40);
+
+// Defaults for the periodic mid-session access re-check; overridable via
+// Server::new (see main.rs's Y_SWEET_VALIDATE_* CLI/env options).
+pub const DEFAULT_VALIDATE_POLL_EVERY: Duration = Duration::from_secs(10);
+pub const DEFAULT_VALIDATE_RETRY_ATTEMPTS: u32 = 3;
+pub const DEFAULT_VALIDATE_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+const CONNECT_VALIDATE_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+];
 
 fn current_time_epoch_millis() -> u64 {
     let now = std::time::SystemTime::now();
@@ -109,9 +123,19 @@ pub struct Server {
     /// Whether to skip garbage collection in Yrs documents.
     skip_gc: bool,
     metrics: Metrics,
+    backend_url: Option<String>,
+    /// Shared secret sent as `Authorization: Bearer <token>` on every call to
+    /// the backend's `/api/ysweet/validate`, so the backend can confirm the
+    /// caller is actually y-sweet and not just anyone hitting that route.
+    server_token: Option<String>,
+    http_client: reqwest::Client,
+    validate_poll_every: Duration,
+    validate_retry_attempts: u32,
+    validate_retry_delay: Duration,
 }
 
 impl Server {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         store: Option<Box<dyn Store>>,
         checkpoint_freq: Duration,
@@ -122,9 +146,24 @@ impl Server {
         doc_gc: bool,
         max_body_size: Option<usize>,
         skip_gc: bool,
+        backend_url: Option<String>,
+        server_token: Option<String>,
+        validate_poll_every: Duration,
+        validate_retry_attempts: u32,
+        validate_retry_delay: Duration,
     ) -> Result<Self> {
         let docs = Arc::new(DashMap::new());
         let metrics = Metrics::new(docs.clone());
+        if backend_url.is_none() {
+            tracing::warn!(
+                "Y_SWEET_BACKEND_URL is not set. All access-validated requests will be denied."
+            );
+        }
+        if backend_url.is_some() && server_token.is_none() {
+            tracing::warn!(
+                "Y_SWEET_SERVER_TOKEN is not set. Calls to the backend's validate endpoint will be unauthenticated."
+            );
+        }
         Ok(Self {
             docs,
             doc_worker_tracker: TaskTracker::new(),
@@ -140,7 +179,90 @@ impl Server {
             max_body_size,
             skip_gc,
             metrics,
+            backend_url,
+            server_token,
+            http_client: reqwest::Client::new(),
+            validate_poll_every,
+            validate_retry_attempts,
+            validate_retry_delay,
         })
+    }
+
+    /// Calls the Xyne backend to check whether `user_id` currently has the
+    /// given `authorization` level of access to `doc_id` — full (edit) or
+    /// read-only — so a user downgraded from editor to viewer gets caught
+    /// here even though they still technically have *some* access. Fails
+    /// closed (denies) if the backend is unconfigured, unreachable, or
+    /// returns a non-2xx response.
+    async fn validate_user_access(
+        &self,
+        doc_id: &str,
+        user_id: &str,
+        authorization: &Authorization,
+    ) -> bool {
+        let Some(backend_url) = &self.backend_url else {
+            return false;
+        };
+        let url = format!("{}/api/ysweet/validate", backend_url.trim_end_matches('/'));
+        let mut req = self.http_client.post(&url).json(&serde_json::json!({
+            "docId": doc_id,
+            "userId": user_id,
+            "authorization": authorization,
+        }));
+        if let Some(token) = &self.server_token {
+            req = req.bearer_auth(token);
+        }
+        match req.send().await {
+            Ok(resp) => resp.status().is_success(),
+            Err(e) => {
+                tracing::error!(?e, doc_id = %doc_id, user_id = %user_id, "Failed to reach backend for access validation");
+                false
+            }
+        }
+    }
+
+    /// Like `validate_user_access`, but retries transient failures (network
+    /// errors, backend hiccups) up to `VALIDATE_RETRY_ATTEMPTS` times before
+    /// treating the check as a real denial. Used by the periodic mid-session
+    /// poll, where a brief backend blip shouldn't kick an otherwise-valid user.
+    async fn validate_user_access_with_retry(
+        &self,
+        doc_id: &str,
+        user_id: &str,
+        authorization: &Authorization,
+    ) -> bool {
+        for attempt in 1..=self.validate_retry_attempts {
+            if self.validate_user_access(doc_id, user_id, authorization).await {
+                return true;
+            }
+            if attempt < self.validate_retry_attempts {
+                tokio::time::sleep(self.validate_retry_delay).await;
+            }
+        }
+        false
+    }
+
+    /// Like `validate_user_access`, but used for the connect-time check
+    /// (WS upgrade, as-update, etc). Retries on a fixed backoff schedule to
+    /// ride out read-replica lag right after a canvas is created or a
+    /// participant is added, since that check only gets one shot before the
+    /// connection is refused.
+    async fn validate_user_access_with_connect_retry(
+        &self,
+        doc_id: &str,
+        user_id: &str,
+        authorization: &Authorization,
+    ) -> bool {
+        if self.validate_user_access(doc_id, user_id, authorization).await {
+            return true;
+        }
+        for delay in CONNECT_VALIDATE_RETRY_DELAYS {
+            tokio::time::sleep(delay).await;
+            if self.validate_user_access(doc_id, user_id, authorization).await {
+                return true;
+            }
+        }
+        false
     }
 
     pub async fn doc_exists(&self, doc_id: &str) -> bool {
@@ -378,13 +500,8 @@ impl Server {
     }
 
     pub fn routes(self: &Arc<Self>) -> Router {
-        Router::new()
-            .route("/ready", get(ready))
-            .route("/check_store", post(check_store))
-            .route("/check_store", get(check_store_deprecated))
+        let protected = Router::new()
             .route("/doc/ws/:doc_id", get(handle_socket_upgrade_deprecated))
-            .route("/doc/new", post(new_doc))
-            .route("/doc/:doc_id/auth", post(auth_doc))
             .route("/doc/:doc_id/as-update", get(get_doc_as_update_deprecated))
             .route("/doc/:doc_id/update", post(update_doc_deprecated))
             .route("/d/:doc_id/as-update", get(get_doc_as_update))
@@ -393,6 +510,18 @@ impl Server {
                 "/d/:doc_id/ws/:doc_id2",
                 get(handle_socket_upgrade_full_path),
             )
+            .route_layer(middleware::from_fn_with_state(
+                self.clone(),
+                validate_user_middleware,
+            ));
+
+        Router::new()
+            .route("/ready", get(ready))
+            .route("/check_store", post(check_store))
+            .route("/check_store", get(check_store_deprecated))
+            .route("/doc/new", post(new_doc))
+            .route("/doc/:doc_id/auth", post(auth_doc))
+            .merge(protected)
             .with_state(self.clone())
     }
 
@@ -450,18 +579,22 @@ impl Server {
         s.serve_internal(listener, redact_errors, routes).await
     }
 
-    fn verify_doc_token(&self, token: Option<&str>, doc: &str) -> Result<Authorization, AppError> {
+    fn verify_doc_token(
+        &self,
+        token: Option<&str>,
+        doc: &str,
+    ) -> Result<(Authorization, Option<String>), AppError> {
         if let Some(authenticator) = &self.authenticator {
             if let Some(token) = token {
-                let authorization = authenticator
+                let claims = authenticator
                     .verify_doc_token(token, doc, current_time_epoch_millis())
                     .map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
-                Ok(authorization)
+                Ok((claims.authorization, claims.user_id))
             } else {
                 Err((StatusCode::UNAUTHORIZED, anyhow!("No token provided.")))?
             }
         } else {
-            Ok(Authorization::Full)
+            Ok((Authorization::Full, None))
         }
     }
 
@@ -532,7 +665,7 @@ async fn update_doc(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let token = get_token_from_header(auth_header);
-    let authorization = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
+    let (authorization, _user_id) = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
     update_doc_inner(doc_id, server_state, authorization, body).await
 }
 
@@ -579,6 +712,7 @@ async fn handle_socket_upgrade(
     ws: WebSocketUpgrade,
     Path(doc_id): Path<String>,
     authorization: Authorization,
+    user_id: Option<String>,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
     if !matches!(authorization, Authorization::Full) && !server_state.docs.contains_key(&doc_id) {
@@ -595,9 +729,19 @@ async fn handle_socket_upgrade(
     let awareness = dwskv.awareness();
     let cancellation_token = server_state.cancellation_token.clone();
     let metrics = server_state.metrics.clone();
+    let server_state_for_socket = server_state.clone();
 
     Ok(ws.on_upgrade(move |socket| {
-        handle_socket(socket, awareness, authorization, cancellation_token, metrics, doc_id)
+        handle_socket(
+            socket,
+            awareness,
+            authorization,
+            user_id,
+            cancellation_token,
+            metrics,
+            doc_id,
+            server_state_for_socket,
+        )
     }))
 }
 
@@ -610,8 +754,8 @@ async fn handle_socket_upgrade_deprecated(
     tracing::warn!(
         "/doc/ws/:doc_id is deprecated; call /doc/:doc_id/auth instead and use the returned URL."
     );
-    let authorization = server_state.verify_doc_token(params.token.as_deref(), &doc_id)?;
-    handle_socket_upgrade(ws, Path(doc_id), authorization, State(server_state)).await
+    let (authorization, user_id) = server_state.verify_doc_token(params.token.as_deref(), &doc_id)?;
+    handle_socket_upgrade(ws, Path(doc_id), authorization, user_id, State(server_state)).await
 }
 
 async fn handle_socket_upgrade_full_path(
@@ -626,8 +770,8 @@ async fn handle_socket_upgrade_full_path(
             anyhow!("For Yjs compatibility, the doc_id appears twice in the URL. It must be the same in both places, but we got {} and {}.", doc_id, doc_id2),
         ));
     }
-    let authorization = server_state.verify_doc_token(params.token.as_deref(), &doc_id)?;
-    handle_socket_upgrade(ws, Path(doc_id), authorization, State(server_state)).await
+    let (authorization, user_id) = server_state.verify_doc_token(params.token.as_deref(), &doc_id)?;
+    handle_socket_upgrade(ws, Path(doc_id), authorization, user_id, State(server_state)).await
 }
 
 async fn handle_socket_upgrade_single(
@@ -645,18 +789,21 @@ async fn handle_socket_upgrade_single(
     }
 
     // the doc server is meant to be run in Plane, so we expect verified plane
-    // headers to be used for authorization.
+    // headers to be used for authorization. Plane mode carries no userId claim,
+    // so the periodic mid-session poll never runs for these connections.
     let authorization = get_authorization_from_plane_header(headers)?;
-    handle_socket_upgrade(ws, Path(single_doc_id), authorization, State(server_state)).await
+    handle_socket_upgrade(ws, Path(single_doc_id), authorization, None, State(server_state)).await
 }
 
 async fn handle_socket(
     socket: WebSocket,
     awareness: Arc<RwLock<Awareness>>,
     authorization: Authorization,
+    user_id: Option<String>,
     cancellation_token: CancellationToken,
     metrics: Metrics,
     doc_id: String,
+    server_state: Arc<Server>,
 ) {
     metrics.active_connections.add(1, &[]);
     let (mut sink, mut stream) = socket.split();
@@ -701,6 +848,40 @@ async fn handle_socket(
             }
         }
     });
+
+    // Periodically re-checks with the Xyne backend that this connection's
+    // user still has access, so a mid-session permission revocation closes
+    // the connection instead of leaving it open until the client reconnects.
+    // Only runs when the token carried a userId (i.e. a signing key is
+    // configured) — see validate_user_middleware for why that's optional.
+    if let Some(user_id) = user_id {
+        let server_state_poll = server_state.clone();
+        let doc_id_poll = doc_id.clone();
+        let conn_cancel_poll = conn_cancel.clone();
+        let authorization_poll = authorization.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(server_state_poll.validate_poll_every);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick fires immediately; skip it since access was
+            // already checked once by validate_user_middleware at connect time.
+            ticker.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if !server_state_poll.validate_user_access_with_retry(&doc_id_poll, &user_id, &authorization_poll).await {
+                            tracing::info!(doc_id = %doc_id_poll, user_id = %user_id, "Access revoked mid-session; closing connection");
+                            conn_cancel_poll.cancel();
+                            break;
+                        }
+                    }
+                    _ = conn_cancel_poll.cancelled() => {
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     let connection = DocConnection::new(awareness, authorization, move |bytes| {
         if let Err(e) = send.try_send(bytes.to_vec()) {
@@ -826,9 +1007,13 @@ async fn auth_doc(
 
     let Json(AuthDocRequest {
         authorization,
+        user_id,
         valid_for_seconds,
-        ..
     }) = body.unwrap_or_default();
+
+    let Some(user_id) = user_id else {
+        Err((StatusCode::FORBIDDEN, anyhow!("userId is required")))?
+    };
 
     if !server_state.doc_exists(&doc_id).await {
         Err((StatusCode::NOT_FOUND, anyhow!("Doc {} not found", doc_id)))?;
@@ -838,12 +1023,10 @@ async fn auth_doc(
     let expiration_time =
         ExpirationTimeEpochMillis(current_time_epoch_millis() + valid_for_seconds * 1000);
 
-    let token = if let Some(auth) = &server_state.authenticator {
-        let token = auth.gen_doc_token(&doc_id, authorization, expiration_time);
-        Some(token)
-    } else {
-        None
-    };
+    let token = server_state
+        .authenticator
+        .as_ref()
+        .map(|auth| auth.gen_doc_token(&doc_id, Some(user_id), authorization, expiration_time));
 
     let url = if let Some(url_prefix) = &server_state.url_prefix {
         let mut url_prefix = url_prefix.clone();
@@ -876,6 +1059,62 @@ async fn auth_doc(
         token,
         authorization,
     }))
+}
+
+/// Runs in front of `as-update`, `update`, and the WebSocket-upgrade routes.
+/// Resolves the request's token to a userId (via `token_identities`, set at
+/// `/doc/:doc_id/auth` time) and asks the Xyne backend whether that user
+/// still has access to this doc. Rejects with 403 if there's no token, no
+/// associated userId, or the backend denies access.
+async fn validate_user_middleware(
+    State(server_state): State<Arc<Server>>,
+    Path(params): Path<HashMap<String, String>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    if server_state.authenticator.is_none() {
+        return Ok(next.run(req).await);
+    }
+
+    let doc_id = params
+        .get("doc_id")
+        .cloned()
+        .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, anyhow!("Missing doc_id")))?;
+
+    let token = extract_request_token(&req)
+        .ok_or_else(|| AppError(StatusCode::FORBIDDEN, anyhow!("Missing token")))?;
+
+    let (authorization, user_id) = server_state.verify_doc_token(Some(&token), &doc_id)?;
+
+    let Some(user_id) = user_id else {
+        return Err(AppError(
+            StatusCode::FORBIDDEN,
+            anyhow!("Token has no associated userId"),
+        ));
+    };
+
+    if !server_state
+        .validate_user_access_with_connect_retry(&doc_id, &user_id, &authorization)
+        .await
+    {
+        return Err(AppError(StatusCode::FORBIDDEN, anyhow!("Access denied")));
+    }
+
+    Ok(next.run(req).await)
+}
+
+fn extract_request_token(req: &Request) -> Option<String> {
+    if let Some(query) = req.uri().query() {
+        if let Some((_, v)) = url::form_urlencoded::parse(query.as_bytes()).find(|(k, _)| k == "token")
+        {
+            return Some(v.into_owned());
+        }
+    }
+    req.headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
 }
 
 fn get_token_from_header(
